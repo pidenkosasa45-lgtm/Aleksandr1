@@ -111,6 +111,7 @@ class MainActivity : Activity() {
         btn.text = if (StreamService.running) "Остановить" else "Запустить"
         val sb = StringBuilder(StreamService.status)
         if (StreamService.running && StreamService.url.isNotEmpty()) {
+            sb.append("\n\nФакт: ").append(StreamService.fpsNow).append(" fps")
             sb.append("\n\nRTSP: ").append(StreamService.url)
             sb.append("\n\nWindows: Параметры → Bluetooth и устройства → Камеры → Добавить устройство")
         }

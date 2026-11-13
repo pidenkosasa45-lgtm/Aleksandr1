@@ -40,6 +40,10 @@ class CameraStreamer(
     private var evRange: Range<Int>? = null
     private var fpsRange: Range<Int>? = null
     private var highSpeed = false
+    private var experimental = false
+    private var chars: CameraCharacteristics? = null
+    private var fCount = 0
+    private var fT = System.currentTimeMillis()
     private var diag = ""
     @Volatile private var stopped = false
 
@@ -50,6 +54,7 @@ class CameraStreamer(
             mgr.getCameraCharacteristics(it).get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
         } ?: mgr.cameraIdList[0]
         val ch = mgr.getCameraCharacteristics(id)
+        chars = ch
 
         // fps range (normal mode)
         val ranges = ch.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) ?: emptyArray()
@@ -87,9 +92,30 @@ class CameraStreamer(
             }
         } catch (_: Exception) {
         }
+        if (reqFps > 30 && !highSpeed && (range?.upper ?: 0) < reqFps) {
+            experimental = true
+            range = Range(reqFps, reqFps)
+        }
         fpsRange = range
-        val encFps = minOf(reqFps, range?.upper ?: reqFps)
+        val encFps = if (experimental) reqFps else minOf(reqFps, range?.upper ?: reqFps)
+        val vendor = try {
+            ch.availableCaptureRequestKeys.map { it.name }.filter {
+                val n = it.lowercase()
+                n.contains("fps") || n.contains("hfr") || n.contains("highspeed") || n.contains("high_speed") ||
+                    n.contains("streamingfeature") || n.contains("slow") || n.contains("60")
+            }
+        } catch (_: Exception) { emptyList() }
+        val cams = try {
+            mgr.cameraIdList.joinToString(" ") { cid ->
+                val c = mgr.getCameraCharacteristics(cid)
+                val mx = c.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)?.maxOfOrNull { it.upper }
+                "$cid:${c.get(CameraCharacteristics.LENS_FACING)}/$mx"
+            }
+        } catch (_: Exception) { "?" }
         diag = "Обычные fps: " + ranges.joinToString(" ") { "[${it.lower}-${it.upper}]" } +
+            "\nКамеры(id:сторона/макс fps): $cams" +
+            "\nКлючи: " + (if (vendor.isEmpty()) "нет" else vendor.joinToString(", ")) +
+            (if (experimental) "\nРежим: эксперимент (MTK-ключ)" else "") +
             "\nHigh-speed: " + (if (hsInfo.isEmpty()) "нет" else hsInfo.toString().trim()) +
             (if (highSpeed) "\nРежим: high-speed" else "")
 
@@ -118,6 +144,13 @@ class CameraStreamer(
                             server.setConfig(data)
                         } else {
                             server.sendFrame(data, info.presentationTimeUs, info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0)
+                            fCount++
+                            val now = System.currentTimeMillis()
+                            if (now - fT >= 1000) {
+                                StreamService.fpsNow = (fCount * 1000L / (now - fT)).toInt()
+                                fCount = 0
+                                fT = now
+                            }
                         }
                     }
                     codec.releaseOutputBuffer(index, false)
@@ -171,6 +204,17 @@ class CameraStreamer(
         b.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
         fpsRange?.let { b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) }
         evRange?.let { b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, ev.coerceIn(it.lower, it.upper)) }
+        if (experimental) {
+            try {
+                for (k in chars?.availableCaptureRequestKeys ?: emptyList()) {
+                    if (k.name == "com.mediatek.streamingfeature.hfpsMode") {
+                        @Suppress("UNCHECKED_CAST")
+                        b.set(k as CaptureRequest.Key<Int>, 1)
+                    }
+                }
+            } catch (_: Exception) {
+            }
+        }
         return b
     }
 

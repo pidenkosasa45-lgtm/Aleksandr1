@@ -21,6 +21,7 @@ class StreamService : Service() {
         @Volatile var running = false
         @Volatile var status = "Остановлено"
         @Volatile var url = ""
+        @Volatile var fpsNow = 0
     }
 
     private var rtsp: RtspServer? = null
@@ -142,6 +143,7 @@ class StreamService : Service() {
         try { mcast?.release() } catch (_: Exception) {}
         status = "Остановлено"
         url = ""
+        fpsNow = 0
         instance = null
         super.onDestroy()
     }
