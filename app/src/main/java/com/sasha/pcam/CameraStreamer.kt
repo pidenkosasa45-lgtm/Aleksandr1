@@ -3,6 +3,7 @@ package com.sasha.pcam
 import android.annotation.SuppressLint
 import android.content.Context
 import android.hardware.camera2.CameraCaptureSession
+import android.hardware.camera2.CameraConstrainedHighSpeedCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
@@ -38,6 +39,8 @@ class CameraStreamer(
     private var surface: Surface? = null
     private var evRange: Range<Int>? = null
     private var fpsRange: Range<Int>? = null
+    private var highSpeed = false
+    private var diag = ""
     @Volatile private var stopped = false
 
     @SuppressLint("MissingPermission")
@@ -48,23 +51,47 @@ class CameraStreamer(
         } ?: mgr.cameraIdList[0]
         val ch = mgr.getCameraCharacteristics(id)
 
-        // fps range
+        // fps range (normal mode)
         val ranges = ch.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) ?: emptyArray()
         val exact = ranges.firstOrNull { it.lower == reqFps && it.upper == reqFps }
-        val range = exact
+        var range = exact
             ?: ranges.filter { it.upper >= reqFps }.minWithOrNull(compareBy({ it.upper }, { -it.lower }))
             ?: ranges.maxByOrNull { it.upper }
-        fpsRange = range
-        val encFps = minOf(reqFps, range?.upper ?: reqFps)
 
         // size
         val map = ch.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
         val sizes = map?.getOutputSizes(MediaCodec::class.java) ?: emptyArray()
-        val size = if (sizes.any { it.width == reqW && it.height == reqH }) Size(reqW, reqH)
+        var size = if (sizes.any { it.width == reqW && it.height == reqH }) Size(reqW, reqH)
         else sizes.filter { it.width <= reqW && it.height <= reqH && it.width * 9 == it.height * 16 }
             .maxByOrNull { it.width * it.height }
             ?: sizes.filter { it.width <= reqW && it.height <= reqH }.maxByOrNull { it.width * it.height }
             ?: Size(1280, 720)
+
+        // high speed mode, if normal mode cannot give the requested fps
+        val hsInfo = StringBuilder()
+        try {
+            map?.highSpeedVideoSizes?.forEach { sz ->
+                val rs = map.getHighSpeedVideoFpsRangesFor(sz)
+                hsInfo.append("${sz.width}x${sz.height}:").append(rs.joinToString("") { "[${it.lower}-${it.upper}]" }).append(" ")
+            }
+            if (reqFps > 30 && ranges.none { it.upper >= reqFps } && map != null) {
+                val hsSize = map.highSpeedVideoSizes.firstOrNull { it.width == reqW && it.height == reqH }
+                if (hsSize != null) {
+                    val r = map.getHighSpeedVideoFpsRangesFor(hsSize).filter { it.upper == reqFps }.maxByOrNull { it.lower }
+                    if (r != null) {
+                        highSpeed = true
+                        range = r
+                        size = hsSize
+                    }
+                }
+            }
+        } catch (_: Exception) {
+        }
+        fpsRange = range
+        val encFps = minOf(reqFps, range?.upper ?: reqFps)
+        diag = "Обычные fps: " + ranges.joinToString(" ") { "[${it.lower}-${it.upper}]" } +
+            "\nHigh-speed: " + (if (hsInfo.isEmpty()) "нет" else hsInfo.toString().trim()) +
+            (if (highSpeed) "\nРежим: high-speed" else "")
 
         evRange = ch.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)
 
@@ -133,35 +160,54 @@ class CameraStreamer(
         }, handler)
     }
 
+    private var hsSession: CameraConstrainedHighSpeedCaptureSession? = null
+
+    private fun buildRequest(device: CameraDevice, surf: Surface): CaptureRequest.Builder {
+        val b = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
+        b.addTarget(surf)
+        b.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+        b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+        b.set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
+        b.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+        fpsRange?.let { b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) }
+        evRange?.let { b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, ev.coerceIn(it.lower, it.upper)) }
+        return b
+    }
+
+    private fun applyRequest(s: CameraCaptureSession, b: CaptureRequest.Builder) {
+        if (highSpeed) {
+            val hs = s as CameraConstrainedHighSpeedCaptureSession
+            hs.setRepeatingBurst(hs.createHighSpeedRequestList(b.build()), null, handler)
+        } else {
+            s.setRepeatingRequest(b.build(), null, handler)
+        }
+    }
+
     @Suppress("DEPRECATION")
     private fun createSession(device: CameraDevice, desc: String) {
         val surf = surface ?: return
-        device.createCaptureSession(listOf(surf), object : CameraCaptureSession.StateCallback() {
+        val cb = object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(s: CameraCaptureSession) {
                 session = s
-                val b = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
-                b.addTarget(surf)
-                b.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
-                b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
-                b.set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
-                b.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
-                fpsRange?.let { b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) }
-                evRange?.let { b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, ev.coerceIn(it.lower, it.upper)) }
-                builder = b
                 try {
-                    s.setRepeatingRequest(b.build(), null, handler)
-                    onStatus("Камера: $desc")
+                    val b = buildRequest(device, surf)
+                    builder = b
+                    applyRequest(s, b)
+                    onStatus("Камера: $desc\n$diag")
                 } catch (e: Exception) {
-                    onStatus("Ошибка запуска съёмки: ${e.message}")
+                    onStatus("Ошибка запуска съёмки: ${e.message}\n$diag")
+                    onConfigFailed?.invoke()
                 }
             }
             override fun onConfigureFailed(s: CameraCaptureSession) {
                 if (!stopped) {
-                    onStatus("Не удалось настроить камеру ($desc)")
+                    onStatus("Не удалось настроить камеру ($desc)\n$diag")
                     onConfigFailed?.invoke()
                 }
             }
-        }, handler)
+        }
+        if (highSpeed) device.createConstrainedHighSpeedCaptureSession(listOf(surf), cb, handler)
+        else device.createCaptureSession(listOf(surf), cb, handler)
     }
 
     fun setEv(v: Int) {
@@ -170,7 +216,7 @@ class CameraStreamer(
         val r = evRange ?: return
         try {
             b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, v.coerceIn(r.lower, r.upper))
-            session?.setRepeatingRequest(b.build(), null, handler)
+            session?.let { applyRequest(it, b) }
         } catch (_: Exception) {
         }
     }
